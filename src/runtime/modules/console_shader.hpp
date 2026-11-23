@@ -22,6 +22,8 @@ enum class ShaderStage {
 // whether the container's DXIL part has no bitcode
 bool console_only_shader(std::span<const std::uint8_t> container);
 bool shader_has_dxil(std::span<const std::uint8_t> container);
+// whether the container has code for the console's GPU (XDAT), with bitcode or without
+bool shader_has_console_code(std::span<const std::uint8_t> container);
 // The machine code of such a shader, as little-endian words up to and including the one
 // that ends the program. Empty if it is not found.
 std::vector<std::uint32_t> console_shader_code(std::span<const std::uint8_t> container);

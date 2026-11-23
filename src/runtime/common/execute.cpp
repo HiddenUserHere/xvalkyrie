@@ -701,6 +701,59 @@ LONG WINAPI at_breakpoint(EXCEPTION_POINTERS *info) {
                          at_rdx[0], at_rdx[1], at_rdx[2], at_rdx[3], at_r8[0], at_r8[1], at_r8[2],
                          at_r8[3], at_r8[4],
                          detail::guest_location(*reinterpret_cast<void **>(context.Rsp)).c_str());
+            // XV_BREAK_REGION: the memory rdx points into, to tell whose it is
+            if (std::getenv("XV_BREAK_REGION")) {
+                MEMORY_BASIC_INFORMATION region{};
+                if (VirtualQuery(reinterpret_cast<void *>(context.Rdx), &region, sizeof region)) {
+                    std::uint8_t start[16]{};
+                    read(reinterpret_cast<std::uint64_t>(region.AllocationBase), start,
+                         sizeof start);
+                    std::string bytes;
+                    for (const auto byte : start) {
+                        char hex[4];
+                        std::snprintf(hex, sizeof hex, "%02x", byte);
+                        bytes += hex;
+                    }
+                    std::fprintf(stderr,
+                                 "[Break]   rdx in allocation %p, region %p of 0x%zx bytes, state "
+                                 "0x%lx type 0x%lx protection 0x%lx, starting %s\n",
+                                 region.AllocationBase, region.BaseAddress, region.RegionSize,
+                                 region.State, region.Type, region.Protect, bytes.c_str());
+                }
+            }
+            // a register that points at a shader container: the parts it is made of
+            const std::pair<const char *, std::uint64_t> registers[] = {
+                {"rcx", context.Rcx}, {"rdx", context.Rdx}, {"r8", context.R8}};
+            for (const auto &[name, address] : registers) {
+                std::uint32_t header[8]{};
+                read(address, header, sizeof header);
+                if (header[0] != 0x43425844 || !header[7] || header[7] > 32)
+                    continue;
+                std::vector<std::uint32_t> offsets(header[7]);
+                read(address + 32, offsets.data(), offsets.size() * 4);
+                std::string parts;
+                for (const auto offset : offsets) {
+                    std::uint32_t part[2]{};
+                    read(address + offset, part, sizeof part);
+                    parts += ' ';
+                    parts.append(reinterpret_cast<const char *>(&part[0]), 4);
+                    parts += ':' + std::to_string(part[1]);
+                    // the start of a title's private part, which says what it holds
+                    if (!std::memcmp(&part[0], "PRIV", 4)) {
+                        std::uint8_t start[16]{};
+                        read(address + offset + 8, start, std::min<std::uint32_t>(part[1], 16));
+                        char hex[4];
+                        parts += '[';
+                        for (std::uint32_t i = 0; i < std::min<std::uint32_t>(part[1], 16); ++i) {
+                            std::snprintf(hex, sizeof hex, "%02x", start[i]);
+                            parts += hex;
+                        }
+                        parts += ']';
+                    }
+                }
+                std::fprintf(stderr, "[Break]   %s is a container of %u bytes:%s\n", name,
+                             header[6], parts.c_str());
+            }
             std::fflush(stderr);
         }
         poke(point.address, point.original);

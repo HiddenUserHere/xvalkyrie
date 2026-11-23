@@ -33,15 +33,37 @@ constexpr GUID status_iid{
 constexpr GUID queue_iid{
     0xa3f6649a, 0x8c2c, 0x4b3a, {0x8b, 0x6e, 0x10, 0x18, 0x6a, 0x04, 0xb9, 0xbc}};
 
+// a later GDK's IDStorageFactoryX, asked for by newer titles; its methods start as the
+// earlier one's do
+constexpr GUID factory_iid_later{
+    0x62959d11, 0xd45f, 0x4884, {0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae}};
+// and the queue that later factory makes (its slot 10)
+constexpr GUID queue_iid_later{
+    0x3c02cb0c, 0xc050, 0x4195, {0x99, 0xa1, 0xa1, 0xce, 0x94, 0xba, 0x33, 0xc5}};
+// A method of the later interfaces nothing here knows yet: it says so once, and fails
+void unknown_method(const char *object, int slot) {
+    static std::atomic<std::uint32_t> shown[2]{};
+    auto &seen = shown[object[0] == 'q'];
+    if (const auto bit = 1u << (slot & 31); !(seen.fetch_or(bit) & bit))
+        std::fprintf(stderr, "[Runtime] DirectStorage: unimplemented %s method %d\n", object, slot);
+}
+
 template <class Interface> class Object : public Interface {
   public:
-    explicit Object(const GUID &iid) : iid_(iid) {}
+    explicit Object(const GUID &iid, const GUID &also = GUID_NULL) : iid_(iid), also_(also) {}
     virtual ~Object() = default;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
         if (!object)
             return E_POINTER;
-        if (iid != IID_IUnknown && iid != iid_) {
+        if (iid != IID_IUnknown && iid != iid_ && (also_ == GUID_NULL || iid != also_)) {
             *object = nullptr;
+            if (static std::atomic<int> shown{0}; shown++ < 8)
+                std::fprintf(stderr,
+                             "[Runtime] DirectStorage: interface {%08lx-%04hx-%04hx-%02x%02x-"
+                             "%02x%02x%02x%02x%02x%02x} is not known\n",
+                             iid.Data1, iid.Data2, iid.Data3, iid.Data4[0], iid.Data4[1],
+                             iid.Data4[2], iid.Data4[3], iid.Data4[4], iid.Data4[5], iid.Data4[6],
+                             iid.Data4[7]);
             return E_NOINTERFACE;
         }
         AddRef();
@@ -57,7 +79,7 @@ template <class Interface> class Object : public Interface {
     }
 
   private:
-    GUID iid_;
+    GUID iid_, also_;
     std::atomic<ULONG> references_{1};
 };
 
@@ -109,6 +131,13 @@ struct QueueInterface : IUnknown {
     virtual HANDLE GetErrorEvent() = 0;
     virtual void RetrieveErrorRecord(ErrorRecord *record) = 0;
     virtual void Query(QueueInfo *info) = 0;
+    // the later queue's methods past the earlier one's (slots 12 on)
+    virtual HRESULT Later12() { return unknown_method("queue", 12), E_NOTIMPL; }
+    virtual HRESULT Later13() { return unknown_method("queue", 13), E_NOTIMPL; }
+    virtual HRESULT Later14() { return unknown_method("queue", 14), E_NOTIMPL; }
+    virtual HRESULT Later15() { return unknown_method("queue", 15), E_NOTIMPL; }
+    virtual HRESULT Later16() { return unknown_method("queue", 16), E_NOTIMPL; }
+    virtual HRESULT Later17() { return unknown_method("queue", 17), E_NOTIMPL; }
 };
 struct FactoryInterface : IUnknown {
     virtual HRESULT CreateQueue(const QueueDesc *desc, REFIID iid, void **queue) = 0;
@@ -118,6 +147,14 @@ struct FactoryInterface : IUnknown {
     virtual HRESULT SetCpuAffinity(UINT64 affinity) = 0;
     virtual void SetDebugFlags(UINT32 flags) = 0;
     virtual HRESULT SetStagingBufferSize(UINT32 size) = 0;
+    // the later factory's (slots 9 on): 10 makes the later queue from a longer description
+    // (the earlier one's, then a word kit 0x20004's title sets to 1)
+    virtual HRESULT Later9() { return unknown_method("factory", 9), E_NOTIMPL; }
+    virtual HRESULT CreateQueueLater(const QueueDesc *desc, REFIID iid, void **queue) = 0;
+    virtual HRESULT Later11() { return unknown_method("factory", 11), E_NOTIMPL; }
+    virtual HRESULT Later12() { return unknown_method("factory", 12), E_NOTIMPL; }
+    virtual HRESULT Later13() { return unknown_method("factory", 13), E_NOTIMPL; }
+    virtual HRESULT Later14() { return unknown_method("factory", 14), E_NOTIMPL; }
 };
 
 class File final : public Object<FileInterface> {
@@ -225,7 +262,7 @@ HRESULT read(const Request &request) {
 class Queue final : public Object<QueueInterface> {
   public:
     explicit Queue(const QueueDesc &desc)
-        : Object(queue_iid), desc_(desc), name_(desc.name ? desc.name : ""),
+        : Object(queue_iid, queue_iid_later), desc_(desc), name_(desc.name ? desc.name : ""),
           error_(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {
         desc_.name = name_.c_str();
     }
@@ -275,6 +312,36 @@ class Queue final : public Object<QueueInterface> {
         for (auto &entry : work) {
             if (auto *const request = std::get_if<Request>(&entry)) {
                 const auto result = read(*request);
+                // XV_FILE_DEST=<hex address>: the requests whose destination holds it ("all":
+                // every request)
+                if (static const char *const watched = std::getenv("XV_FILE_DEST"); watched) {
+                    const bool all = !std::strcmp(watched, "all");
+                    const auto at = std::strtoull(watched, nullptr, 16);
+                    const auto start = reinterpret_cast<std::uintptr_t>(request->destination);
+                    if (all || (at >= start && at < start + request->destination_size))
+                        std::fprintf(stderr,
+                                     "[Runtime] DirectStorage request to %p (%u bytes) holds %llx: "
+                                     "options 0x%llx, %u bytes at %llu of %p: 0x%08lx\n",
+                                     request->destination, request->destination_size,
+                                     static_cast<unsigned long long>(at), request->options,
+                                     request->source_size, request->file_offset, request->source,
+                                     static_cast<unsigned long>(result));
+                }
+                // XV_FILE_TRACE: each kind of request once, whatever came first
+                if (std::getenv("XV_FILE_TRACE")) {
+                    static std::mutex kinds_mutex;
+                    static std::vector<UINT64> kinds;
+                    const std::lock_guard lock(kinds_mutex);
+                    if (std::find(kinds.begin(), kinds.end(), request->options) == kinds.end()) {
+                        kinds.push_back(request->options);
+                        std::fprintf(stderr,
+                                     "[Runtime] DirectStorage: first request with options "
+                                     "0x%llx (%u bytes to %u, intermediate %u): 0x%08lx\n",
+                                     request->options, request->source_size,
+                                     request->destination_size, request->intermediate_size,
+                                     static_cast<unsigned long>(result));
+                    }
+                }
                 // XV_FILE_TRACE: the first requests, and every one that fails
                 if (static std::atomic<int> shown{0};
                     std::getenv("XV_FILE_TRACE") && (FAILED(result) || shown < 24) && shown++ < 200)
@@ -369,7 +436,7 @@ class Queue final : public Object<QueueInterface> {
 
 class Factory final : public Object<FactoryInterface> {
   public:
-    Factory() : Object(factory_iid) {}
+    Factory() : Object(factory_iid, factory_iid_later) {}
     HRESULT CreateQueue(const QueueDesc *desc, REFIID iid, void **queue) override {
         if (!desc || !queue)
             return E_POINTER;
@@ -410,6 +477,9 @@ class Factory final : public Object<FactoryInterface> {
         const auto result = made->QueryInterface(iid, status);
         made->Release();
         return result;
+    }
+    HRESULT CreateQueueLater(const QueueDesc *desc, REFIID iid, void **queue) override {
+        return CreateQueue(desc, iid, queue);
     }
     HRESULT SetCpuAffinity(UINT64) override { return S_OK; }
     void SetDebugFlags(UINT32) override {}

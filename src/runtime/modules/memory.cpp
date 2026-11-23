@@ -46,6 +46,9 @@ struct Physical {
 };
 Physical &physical() {
     static Physical state;
+    // page 0 is never handed out: to the scatter mapping a frame number of 0 means none
+    static const bool kept_back = (state.used[0] = true);
+    static_cast<void>(kept_back);
     return state;
 }
 Reservation *reservation_at(Physical &state, std::uintptr_t address, std::uintptr_t *base) {
@@ -80,6 +83,12 @@ bool take_pages(Physical &state, std::uintptr_t count, std::uintptr_t run, ULONG
         state.used[pages[j]] = false;
     return false;
 }
+// What a title is given for a page is a page frame number, which counts 4 KiB frames as
+// Windows' do: a 64 KiB page is 16 of them, and titles take the low four bits for flags of
+// their own (one masks them off before mapping, which turned 16 pages of ours into one).
+constexpr ULONG_PTR frames_per_page = page / 4096;
+ULONG_PTR frame_of(ULONG_PTR number) { return number * frames_per_page; }
+ULONG_PTR page_of(ULONG_PTR frame) { return frame / frames_per_page; }
 void release_page(Physical &state, ULONG_PTR number) {
     state.used[number] = false;
     state.dirty[number] = true;
@@ -116,14 +125,28 @@ void *reserve(void *address, std::uintptr_t size, DWORD type) {
     if (!state.section)
         return nullptr;
     size = (size + page - 1) & ~(page - 1);
-    MEM_ADDRESS_REQUIREMENTS requirements{};
-    requirements.Alignment = type & mem_4mb_pages && !address ? 4u << 20 : 0;
-    MEM_EXTENDED_PARAMETER parameter{};
-    parameter.Type = MemExtendedParameterAddressRequirements;
-    parameter.Pointer = &requirements;
-    auto *const base =
-        VirtualAlloc2(GetCurrentProcess(), address, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                      PAGE_NOACCESS, &parameter, 1);
+    void *base = nullptr;
+    if (type & MEM_REPLACE_PLACEHOLDER && address) {
+        // a piece of a placeholder the title reserved and split itself: it becomes the
+        // reservation, cut off from whatever follows it
+        MEMORY_BASIC_INFORMATION region{};
+        if (reinterpret_cast<std::uintptr_t>(address) & (page - 1) ||
+            !VirtualQuery(address, &region, sizeof region) || region.State != MEM_RESERVE) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return nullptr;
+        }
+        if (region.RegionSize > size)
+            VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+        base = address;
+    } else {
+        MEM_ADDRESS_REQUIREMENTS requirements{};
+        requirements.Alignment = type & mem_4mb_pages && !address ? 4u << 20 : 0;
+        MEM_EXTENDED_PARAMETER parameter{};
+        parameter.Type = MemExtendedParameterAddressRequirements;
+        parameter.Pointer = &requirements;
+        base = VirtualAlloc2(GetCurrentProcess(), address, size,
+                             MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &parameter, 1);
+    }
     if (!base)
         return nullptr;
     const auto start = reinterpret_cast<std::uintptr_t>(base);
@@ -176,6 +199,30 @@ void *WINAPI virtual_alloc_ex(HANDLE process, void *address, SIZE_T size, DWORD 
         }
         if (type & MEM_COMMIT && commit(reinterpret_cast<std::uintptr_t>(address), size, protect))
             return address;
+        // A title that keeps placeholders of its own (reserves one, splits it with
+        // VirtualFree(MEM_PRESERVE_PLACEHOLDER), fills the pieces): only VirtualAlloc2 has them.
+        if (type & (MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER) && !(type & page_sizes)) {
+            const auto placeholder_types =
+                allocation_types | MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER;
+            auto kept = type & placeholder_types;
+            if (kept & MEM_REPLACE_PLACEHOLDER)
+                kept |= MEM_RESERVE; // VirtualAlloc2 wants it with the replacement
+            const auto protection = kept & MEM_RESERVE_PLACEHOLDER
+                                        ? static_cast<DWORD>(PAGE_NOACCESS)
+                                        : protect & protections;
+            auto *const result =
+                VirtualAlloc2(process, address, size, kept, protection, nullptr, 0);
+            if (!result) {
+                const auto error = GetLastError();
+                std::fprintf(stderr,
+                             "[Runtime] VirtualAlloc2 of %zu bytes at %p, type 0x%lx protect "
+                             "0x%lx failed: %lu\n",
+                             static_cast<std::size_t>(size), address, kept, protection, error);
+                std::fflush(stderr);
+                SetLastError(error);
+            }
+            return result;
+        }
     }
     const auto result =
         VirtualAllocEx(process, address, size, type & allocation_types, protect & protections);
@@ -240,6 +287,8 @@ BOOL WINAPI allocate_title_physical_pages(HANDLE, DWORD type, ULONG_PTR *count, 
         SetLastError(ERROR_OUTOFMEMORY);
         return FALSE;
     }
+    for (ULONG_PTR i = 0; i < *count; ++i)
+        pages[i] = frame_of(pages[i]);
     return TRUE;
 }
 BOOL WINAPI free_title_physical_pages(HANDLE, ULONG_PTR count, ULONG_PTR *pages) {
@@ -250,8 +299,8 @@ BOOL WINAPI free_title_physical_pages(HANDLE, ULONG_PTR count, ULONG_PTR *pages)
     auto &state = physical();
     const std::lock_guard lock(state.mutex);
     for (ULONG_PTR i = 0; i < count; ++i)
-        if (pages[i] < state.used.size())
-            release_page(state, pages[i]);
+        if (page_of(pages[i]) < state.used.size())
+            release_page(state, page_of(pages[i]));
     return TRUE;
 }
 void *WINAPI map_title_physical_pages(void *address, ULONG_PTR count, DWORD type, DWORD protect,
@@ -274,8 +323,8 @@ void *WINAPI map_title_physical_pages(void *address, ULONG_PTR count, DWORD type
         return nullptr;
     }
     for (ULONG_PTR i = 0; i < count; ++i)
-        if (pages[i] >= state.used.size() ||
-            !map(state, *reservation, start + i * page, pages[i], protect, false)) {
+        if (page_of(pages[i]) >= state.used.size() ||
+            !map(state, *reservation, start + i * page, page_of(pages[i]), protect, false)) {
             SetLastError(ERROR_INVALID_PARAMETER);
             return nullptr;
         }
@@ -377,6 +426,44 @@ BOOL WINAPI xmem_free_physical_pages(ULONG_PTR count, ULONG_PTR *pages) {
 void *WINAPI xmem_map_physical_pages(void *address, ULONG_PTR count, ULONG_PTR *pages) {
     return map_title_physical_pages(address, count, mem_large_pages, PAGE_READWRITE, pages);
 }
+// XMemMapPhysicalPagesScatter(addresses, count, pages): MapUserPhysicalPagesScatter of the
+// title's pages, each to an address of its own, each address in one of its reservations of
+// the console's page sizes. A page of 0 (or no pages at all) leaves the address unmapped. One
+// page may go to many addresses: a title backs a sparse range with one page that way.
+BOOL WINAPI xmem_map_physical_pages_scatter(void **addresses, ULONG_PTR count, ULONG_PTR *pages) {
+    if (!addresses && count) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    auto &state = physical();
+    const std::lock_guard lock(state.mutex);
+    for (ULONG_PTR i = 0; i < count; ++i) {
+        const auto at = reinterpret_cast<std::uintptr_t>(addresses[i]);
+        std::uintptr_t base = 0;
+        auto *const reservation = reservation_at(state, at, &base);
+        if (!reservation || at & (page - 1)) {
+            if (static std::atomic<int> shown{0}; shown++ < 4)
+                std::fprintf(stderr,
+                             "[Runtime] XMemMapPhysicalPagesScatter: %p is in no reservation of "
+                             "the console's page sizes\n",
+                             addresses[i]);
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return FALSE;
+        }
+        const ULONG_PTR frame = pages ? pages[i] : 0;
+        const ULONG_PTR number = page_of(frame);
+        if (!frame) {
+            unmap(state, *reservation, at);
+            continue;
+        }
+        if (number >= state.used.size() ||
+            !map(state, *reservation, at, number, PAGE_READWRITE, false)) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
 // XMEM_WORKING_SET_STATISTICS: what a title may use, from what the host has
 struct WorkingSet {
     SIZE_T game_limit, game_used, tools_limit, tools_used;
@@ -457,6 +544,7 @@ void install_xmem(Registry &registry) {
         {"XMemAllocatePhysicalPages", erase(xmem_allocate_physical_pages)},
         {"XMemFreePhysicalPages", erase(xmem_free_physical_pages)},
         {"XMemMapPhysicalPages", erase(xmem_map_physical_pages)},
+        {"XMemMapPhysicalPagesScatter", erase(xmem_map_physical_pages_scatter)},
         {"XMemGetWorkingSetStatistics", erase(xmem_working_set_statistics)},
         {"XMemGetWin32HeapStatistics", erase(not_implemented)},
         {"XMemIsToolsMemAvailable", erase(no)},

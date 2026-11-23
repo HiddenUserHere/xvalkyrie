@@ -803,13 +803,16 @@ std::string console_shader_probe(std::span<const std::uint32_t> words, bool comp
     return why;
 }
 
+bool shader_has_console_code(Bytes container) {
+    const auto dxil = part(container, "DXIL");
+    return dxil.size() >= 28 && !std::memcmp(dxil.data() + 24, "XDAT", 4);
+}
 bool console_only_shader(Bytes container) {
     // The program header says where its bitcode is, from the "DXIL" at offset 8. A shader
-    // with console code may have its bitcode as well, and then the host runs that.
-    const auto dxil = part(container, "DXIL");
-    if (dxil.size() < 28 || std::memcmp(dxil.data() + 24, "XDAT", 4))
-        return false;
-    return !shader_has_dxil(container);
+    // with console code may have its bitcode as well, and then the host runs that, unless it
+    // calls the console's own intrinsics (xbox.global_load_dword_with_cache and the like), which
+    // only shows when the host turns it down (see create_compute_pipeline).
+    return shader_has_console_code(container) && !shader_has_dxil(container);
 }
 
 bool shader_has_dxil(Bytes container) {

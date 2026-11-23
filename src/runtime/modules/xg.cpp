@@ -188,13 +188,141 @@ void optimal_depth_stencil_tile_modes(std::uint32_t, std::uint32_t, std::uint32_
     if (stencil)
         *stencil = 0;
 }
+// The Series computer (XGCreateTextureComputer of xg_xs.dll), for the plain layout: AddRef,
+// Release, GetResourceLayout (2), GetResourceSizeBytes (3), ..., CopyIntoSubresource (8),
+// CopyFromSubresource (9). The copies take (memory of the texture, plane, subresource, linear
+// data, row pitch, depth pitch), as titles of kit 0x20004 call them.
+struct SeriesComputer {
+    void *const *vtable;
+    std::atomic<std::uint32_t> references;
+    SeriesResourceDesc desc;
+};
+std::uint32_t series_add_ref(SeriesComputer *self) { return ++self->references; }
+std::uint32_t series_release(SeriesComputer *self) {
+    const auto left = --self->references;
+    if (!left)
+        delete self;
+    return left;
+}
+// what titles read of XG_RESOURCE_LAYOUT: the size first, then the alignment
+std::int32_t series_layout(SeriesComputer *self, void *layout) {
+    if (!layout)
+        return static_cast<std::int32_t>(0x80070057); // E_INVALIDARG
+    std::memset(layout, 0, layout_bytes);
+    const std::uint64_t header[2] = {series_linear_bytes(self->desc), 4096};
+    std::memcpy(layout, header, sizeof header);
+    return 0;
+}
+std::uint64_t series_size(SeriesComputer *self) { return series_linear_bytes(self->desc); }
+std::int32_t copy_rows(const SeriesComputer *self, std::uint8_t *texture, std::uint32_t subresource,
+                       std::uint8_t *linear, std::uint32_t row_pitch, std::uint32_t depth_pitch,
+                       bool into) {
+    LinearSubresource where{};
+    if (!texture || !linear || !series_linear_subresource(self->desc, subresource, where))
+        return static_cast<std::int32_t>(0x80070057); // E_INVALIDARG
+    for (std::uint32_t z = 0; z < where.depth; ++z)
+        for (std::uint32_t y = 0; y < where.rows; ++y) {
+            auto *const at =
+                texture + where.offset + (std::uint64_t{z} * where.rows + y) * where.row_pitch;
+            auto *const data =
+                linear + std::uint64_t{z} * depth_pitch + std::uint64_t{y} * row_pitch;
+            if (into)
+                std::memcpy(at, data, where.row_pitch);
+            else
+                std::memcpy(data, at, where.row_pitch);
+        }
+    return 0;
+}
+std::int32_t series_copy_into(SeriesComputer *self, void *texture, std::uint32_t,
+                              std::uint32_t subresource, const void *linear,
+                              std::uint32_t row_pitch, std::uint32_t depth_pitch) {
+    return copy_rows(self, static_cast<std::uint8_t *>(texture), subresource,
+                     const_cast<std::uint8_t *>(static_cast<const std::uint8_t *>(linear)),
+                     row_pitch, depth_pitch, true);
+}
+std::int32_t series_copy_from(SeriesComputer *self, void *linear, std::uint32_t,
+                              std::uint32_t subresource, const void *texture,
+                              std::uint32_t row_pitch, std::uint32_t depth_pitch) {
+    return copy_rows(self, const_cast<std::uint8_t *>(static_cast<const std::uint8_t *>(texture)),
+                     subresource, static_cast<std::uint8_t *>(linear), row_pitch, depth_pitch,
+                     false);
+}
+template <int Slot> std::int32_t series_unknown(SeriesComputer *) {
+    if (static std::atomic<bool> shown{false}; !shown.exchange(true)) {
+        std::fprintf(stderr, "[Runtime] unimplemented xg_xs.dll texture computer method %d\n",
+                     Slot);
+        std::fflush(stderr);
+    }
+    return static_cast<std::int32_t>(0x80004001); // E_NOTIMPL
+}
+void *const series_vtable[] = {
+    reinterpret_cast<void *>(&series_add_ref),     reinterpret_cast<void *>(&series_release),
+    reinterpret_cast<void *>(&series_layout),      reinterpret_cast<void *>(&series_size),
+    reinterpret_cast<void *>(&series_unknown<4>),  reinterpret_cast<void *>(&series_unknown<5>),
+    reinterpret_cast<void *>(&series_unknown<6>),  reinterpret_cast<void *>(&series_unknown<7>),
+    reinterpret_cast<void *>(&series_copy_into),   reinterpret_cast<void *>(&series_copy_from),
+    reinterpret_cast<void *>(&series_unknown<10>), reinterpret_cast<void *>(&series_unknown<11>),
+    reinterpret_cast<void *>(&series_unknown<12>), reinterpret_cast<void *>(&series_unknown<13>),
+    reinterpret_cast<void *>(&series_unknown<14>), reinterpret_cast<void *>(&series_unknown<15>),
+};
+std::int32_t create_series_computer(const SeriesResourceDesc *desc, SeriesComputer **computer) {
+    if (!desc || !computer)
+        return static_cast<std::int32_t>(0x80070057); // E_INVALIDARG
+    *computer = new SeriesComputer{series_vtable, 1, *desc};
+    return 0;
+}
+// xg_xs.dll's XGSuggestSwizzleMode(description, flags, layout, options): the swizzle mode for
+// a texture, written where the title points, which is the Layout of the Direct3D 12
+// description it goes on to create the texture with. Console layouts are 0x100 and the mode;
+// mode 0 is linear (SW_LINEAR), which is how textures in the title's memory are read here.
+std::int32_t suggest_swizzle_mode(const void *description, std::uint32_t, std::uint32_t *layout,
+                                  std::uint32_t) {
+    if (!description || !layout)
+        return static_cast<std::int32_t>(0x80070057); // E_INVALIDARG
+    *layout = 0x100;
+    return 0;
+}
 } // namespace
 
+bool series_linear_subresource(const SeriesResourceDesc &desc, std::uint32_t subresource,
+                               LinearSubresource &where) {
+    const std::uint32_t mips = std::max<std::uint32_t>(desc.mip_levels, 1);
+    const bool volume = desc.dimension == 4;
+    const std::uint32_t slices = volume ? 1 : std::max<std::uint32_t>(desc.depth_or_array_size, 1);
+    const auto size = format_size(desc.format);
+    std::uint64_t offset = 0;
+    for (std::uint32_t slice = 0; slice < slices; ++slice)
+        for (std::uint32_t mip = 0; mip < mips; ++mip) {
+            const std::uint32_t w = std::max(static_cast<std::uint32_t>(desc.width >> mip), 1u),
+                                h = std::max(desc.height >> mip, 1u);
+            const std::uint32_t pitch = size.blocks ? (w + 3) / 4 * size.bytes : w * size.bytes;
+            const std::uint32_t rows = size.blocks ? (h + 3) / 4 : h;
+            const std::uint32_t depth =
+                volume ? std::max<std::uint32_t>(desc.depth_or_array_size >> mip, 1) : 1;
+            if (slice * mips + mip == subresource) {
+                where = {offset, pitch, rows, depth};
+                return true;
+            }
+            offset += std::uint64_t{pitch} * rows * depth;
+        }
+    // past the last subresource: where the next one would start, for the size
+    where = {offset, 0, 0, 0};
+    return false;
+}
+std::uint64_t series_linear_bytes(const SeriesResourceDesc &desc) {
+    LinearSubresource end{};
+    series_linear_subresource(desc, ~0u, end);
+    return (end.offset + 4095) & ~std::uint64_t{4095};
+}
+
 void install_xg(Registry &registry, std::string_view module) {
+    registry.add(module, "XGSuggestSwizzleMode", reinterpret_cast<void *>(&suggest_swizzle_mode));
     registry.add(module, "XGCreateTexture2DComputer",
                  reinterpret_cast<void *>(&create_texture2d_computer));
+    // the Series XG takes the Direct3D 12 description; Xbox One's another one
     registry.add(module, "XGCreateTextureComputer",
-                 reinterpret_cast<void *>(&create_texture_computer));
+                 module == "xg_xs.dll" ? reinterpret_cast<void *>(&create_series_computer)
+                                       : reinterpret_cast<void *>(&create_texture_computer));
     registry.add(module, "XGComputeTexture2DLayout", reinterpret_cast<void *>(&texture2d_layout));
     registry.add(module, "XGComputeTexture3DLayout", reinterpret_cast<void *>(&texture3d_layout));
     registry.add(module, "XGComputeOptimalTileMode", reinterpret_cast<void *>(&optimal_tile_mode));

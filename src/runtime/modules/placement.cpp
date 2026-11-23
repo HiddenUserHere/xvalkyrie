@@ -451,8 +451,37 @@ std::uint64_t series_size(void *computer) {
 void series_release(void *computer) {
     reinterpret_cast<ULONG(WINAPI *)(void *)>((*static_cast<void ***>(computer))[1])(computer);
 }
+static_assert(sizeof(SeriesResourceDesc) == sizeof(D3D12_RESOURCE_DESC) &&
+              offsetof(SeriesResourceDesc, format) == offsetof(D3D12_RESOURCE_DESC, Format) &&
+              offsetof(SeriesResourceDesc, layout) == offsetof(D3D12_RESOURCE_DESC, Layout));
+// Without the console's xg_xs.dll the title laid the texture out through our XG, in the plain
+// layout (see xg.hpp): read from there
+bool plain_series_subresources(const Placement &placement, PlacementUpload &upload) {
+    const auto &desc = placement.desc;
+    const auto &layout = reinterpret_cast<const SeriesResourceDesc &>(placement.layout);
+    const UINT mips = std::max<UINT>(desc.MipLevels, 1);
+    const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const UINT slices = volume ? 1 : std::max<UINT>(desc.DepthOrArraySize, 1);
+    for (UINT slice = 0; slice < slices; ++slice)
+        for (UINT mip = 0; mip < mips; ++mip) {
+            LinearSubresource where{};
+            if (!series_linear_subresource(layout, slice * mips + mip, where))
+                return false;
+            const auto bytes = std::size_t{where.row_pitch} * where.rows * where.depth;
+            if (placement.start + where.offset + bytes > placement.end)
+                return false;
+            std::vector<std::byte> linear(bytes);
+            std::memcpy(linear.data(),
+                        reinterpret_cast<const void *>(placement.start + where.offset), bytes);
+            upload.subresources.push_back(std::move(linear));
+            upload.pitches.push_back(where.row_pitch);
+        }
+    return true;
+}
 bool series_subresources(const Placement &placement, PlacementUpload &upload) {
     const auto &desc = placement.desc;
+    if (!series_xg())
+        return plain_series_subresources(placement, upload);
     auto *const computer = series_computer(placement.layout);
     if (!computer)
         return false;
@@ -540,14 +569,21 @@ void track_placement(ID3D12Resource *resource, const void *address,
     if (!resource || !address)
         return;
     const auto desc = resource->GetDesc();
-    if (layout && series_xg() && desc.SampleDesc.Count == 1 &&
+    if (layout && desc.SampleDesc.Count == 1 &&
         (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
          desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)) {
-        // a Series title: the console's own XG says how the texture lies in its memory
-        auto *const computer = series_computer(*layout);
-        const auto bytes = computer ? static_cast<std::size_t>(series_size(computer)) : 0;
-        if (computer)
-            series_release(computer);
+        // a Series title: the console's own XG says how the texture lies in its memory, or
+        // ours, which laid it out plainly, when the console's is not there
+        std::size_t bytes = 0;
+        if (series_xg()) {
+            auto *const computer = series_computer(*layout);
+            bytes = computer ? static_cast<std::size_t>(series_size(computer)) : 0;
+            if (computer)
+                series_release(computer);
+        } else {
+            bytes = static_cast<std::size_t>(
+                series_linear_bytes(reinterpret_cast<const SeriesResourceDesc &>(*layout)));
+        }
         const auto start = reinterpret_cast<std::uintptr_t>(address);
         if (static std::atomic<int> shown{0}; std::getenv("XV_D3D_TRACE") && shown++ < 5)
             std::fprintf(stderr, "[Runtime] placement texture at %llx, layout 0x%x, %zu bytes%s\n",
