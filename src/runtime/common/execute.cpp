@@ -701,6 +701,14 @@ LONG WINAPI at_breakpoint(EXCEPTION_POINTERS *info) {
                          at_rdx[0], at_rdx[1], at_rdx[2], at_rdx[3], at_r8[0], at_r8[1], at_r8[2],
                          at_r8[3], at_r8[4],
                          detail::guest_location(*reinterpret_cast<void **>(context.Rsp)).c_str());
+            // the arguments past the fourth, on the stack above the return address's slot and
+            // the home space, and rbx
+            {
+                std::uint64_t stack[4]{};
+                read(context.Rsp + 0x20, stack, sizeof stack);
+                std::fprintf(stderr, "[Break]   rbx %llx, [rsp+20] %llx %llx %llx %llx\n",
+                             context.Rbx, stack[0], stack[1], stack[2], stack[3]);
+            }
             // XV_BREAK_REGION: the memory rdx points into, to tell whose it is
             if (std::getenv("XV_BREAK_REGION")) {
                 MEMORY_BASIC_INFORMATION region{};

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace xv::runtime::modules {
 FormatSize format_size(std::uint32_t format) {
@@ -247,6 +248,89 @@ std::int32_t series_copy_from(SeriesComputer *self, void *linear, std::uint32_t,
                      subresource, static_cast<std::uint8_t *>(linear), row_pitch, depth_pitch,
                      false);
 }
+// Method 10: GetResourceTiling as the device has it (tiles of the whole resource, packed mips,
+// the tile shape of the others, how many subresource tilings and from which, the tilings), for
+// tiles of 64 KiB in the shape the desktop's standard swizzle gives each element size
+struct PackedMips {
+    std::uint8_t standard, packed;
+    std::uint32_t packed_tiles, first_packed_tile;
+};
+struct TileShape {
+    std::uint32_t width, height, depth;
+};
+// D3D12_SUBRESOURCE_TILING: 12 bytes, which titles keep arrays of on their stack
+struct SubresourceTiling {
+    std::uint32_t width;
+    std::uint16_t height, depth;
+    std::uint32_t first_tile;
+};
+static_assert(sizeof(PackedMips) == 12 && sizeof(TileShape) == 12 &&
+              sizeof(SubresourceTiling) == 12);
+std::int32_t series_tiling(SeriesComputer *self, std::uint32_t *total, PackedMips *packed,
+                           TileShape *shape, std::uint32_t *count, std::uint32_t first,
+                           SubresourceTiling *tilings) {
+    const auto &desc = self->desc;
+    const auto size = format_size(desc.format);
+    // the elements of a 64 KiB tile: 256x256 bytes' worth, halved across as elements grow
+    const std::uint32_t element = std::max(size.bytes, 1u);
+    std::uint32_t across = 256, down = 256;
+    for (std::uint32_t bytes = 1; bytes < element; bytes *= 2)
+        (across > down ? across : down) /= 2;
+    const bool volume = desc.dimension == 4;
+    const std::uint32_t tile_w = across * (size.blocks ? 4 : 1),
+                        tile_h = down * (size.blocks ? 4 : 1), tile_d = volume ? 1 : 1;
+    const std::uint32_t mips = std::max<std::uint32_t>(desc.mip_levels, 1);
+    const std::uint32_t slices = volume ? 1 : std::max<std::uint32_t>(desc.depth_or_array_size, 1);
+    std::uint32_t standard = 0;
+    while (standard < mips &&
+           std::max(static_cast<std::uint32_t>(desc.width >> standard), 1u) >= tile_w &&
+           std::max(desc.height >> standard, 1u) >= tile_h)
+        ++standard;
+    // the packed mips of a slice share tiles, as many as their bytes fill
+    std::uint64_t packed_bytes = 0;
+    for (std::uint32_t mip = standard; mip < mips; ++mip) {
+        LinearSubresource where{};
+        if (series_linear_subresource(desc, mip, where))
+            packed_bytes += std::uint64_t{where.row_pitch} * where.rows * where.depth;
+    }
+    const std::uint32_t packed_tiles =
+        static_cast<std::uint32_t>((packed_bytes + 0xffff) / 0x10000);
+    std::uint32_t tile = 0;
+    std::vector<SubresourceTiling> all(std::size_t{mips} * slices);
+    for (std::uint32_t slice = 0; slice < slices; ++slice) {
+        for (std::uint32_t mip = 0; mip < mips; ++mip) {
+            auto &one = all[std::size_t{slice} * mips + mip];
+            if (mip >= standard) {
+                one = {0, 0, 0, 0xffffffff}; // D3D12_PACKED_TILE
+                continue;
+            }
+            const std::uint32_t w = std::max(static_cast<std::uint32_t>(desc.width >> mip), 1u),
+                                h = std::max(desc.height >> mip, 1u),
+                                d = volume ? std::max<std::uint32_t>(
+                                                 desc.depth_or_array_size >> mip, 1)
+                                           : 1;
+            one = {(w + tile_w - 1) / tile_w, static_cast<std::uint16_t>((h + tile_h - 1) / tile_h),
+                   static_cast<std::uint16_t>((d + tile_d - 1) / tile_d), tile};
+            tile += one.width * one.height * one.depth;
+        }
+        if (slice == 0 && packed)
+            *packed = {static_cast<std::uint8_t>(standard),
+                       static_cast<std::uint8_t>(mips - standard), packed_tiles, tile};
+        tile += packed_tiles;
+    }
+    if (total)
+        *total = tile;
+    if (shape)
+        *shape = {tile_w, tile_h, tile_d};
+    if (count) {
+        const auto available =
+            first < all.size() ? static_cast<std::uint32_t>(all.size() - first) : 0u;
+        *count = std::min(*count, available);
+        for (std::uint32_t i = 0; tilings && i < *count; ++i)
+            tilings[i] = all[first + i];
+    }
+    return 0;
+}
 template <int Slot> std::int32_t series_unknown(SeriesComputer *) {
     if (static std::atomic<bool> shown{false}; !shown.exchange(true)) {
         std::fprintf(stderr, "[Runtime] unimplemented xg_xs.dll texture computer method %d\n",
@@ -261,7 +345,7 @@ void *const series_vtable[] = {
     reinterpret_cast<void *>(&series_unknown<4>),  reinterpret_cast<void *>(&series_unknown<5>),
     reinterpret_cast<void *>(&series_unknown<6>),  reinterpret_cast<void *>(&series_unknown<7>),
     reinterpret_cast<void *>(&series_copy_into),   reinterpret_cast<void *>(&series_copy_from),
-    reinterpret_cast<void *>(&series_unknown<10>), reinterpret_cast<void *>(&series_unknown<11>),
+    reinterpret_cast<void *>(&series_tiling),      reinterpret_cast<void *>(&series_unknown<11>),
     reinterpret_cast<void *>(&series_unknown<12>), reinterpret_cast<void *>(&series_unknown<13>),
     reinterpret_cast<void *>(&series_unknown<14>), reinterpret_cast<void *>(&series_unknown<15>),
 };

@@ -2659,6 +2659,16 @@ D3D12_COMMAND_QUEUE_DESC *STDMETHODCALLTYPE queue_get_desc(void *self,
     auto *const host = queue_host(self);
     return reinterpret_cast<Get>((*reinterpret_cast<Slot **>(host))[18])(host, desc);
 }
+// slot 29 (31 in the later layout, kit 0x20004): a page mapping method of the queue, (count,
+// mappings, page pool, flags, 0), called right after the pages were mapped for the CPU. It
+// puts them in the console GPU's page tables; here the GPU reads resources of its own, so
+// there is nothing to map.
+HRESULT STDMETHODCALLTYPE queue_map_pages(void *, UINT count, const void *, void *, UINT, UINT) {
+    if (static std::atomic<bool> shown{false}; !shown.exchange(true))
+        std::fprintf(stderr, "[Runtime] the queue's page mapping (%u ranges) is not needed here\n",
+                     count);
+    return S_OK;
+}
 // slot 30: PresentX. The console shows the title's own resources; there is no swap chain.
 HRESULT STDMETHODCALLTYPE queue_present_x(void *self, UINT planes, const void *plane_parameters,
                                           const void *present_parameters) {
@@ -2691,6 +2701,7 @@ std::array<Slot, 48> queue_vtable_of(std::index_sequence<Index...>) {
         vtable[ignored] = reinterpret_cast<Slot>(&ignored_queue_method);
     vtable[23] = reinterpret_cast<Slot>(&queue_signal_x);
     vtable[26] = reinterpret_cast<Slot>(&queue_get_desc);
+    vtable[29] = reinterpret_cast<Slot>(&queue_map_pages);
     vtable[30] = reinterpret_cast<Slot>(&queue_present_x);
     // SetHDRToneMapperX: the picture goes to the host's display as the title made it
     vtable[31] = reinterpret_cast<Slot>(&ignored_queue_method);
